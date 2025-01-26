@@ -1,0 +1,197 @@
+# -*-coding:utf-8-*-
+import os
+import pdb
+
+from scipy import io, signal
+import numpy as np
+from tensorflow.keras.utils import to_categorical
+from AdversarialCNN import AdversarialCNN
+import re
+import tensorflow as tf
+import random
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+def LoadDate(path, testsub):
+    path = path + '/' + testsub
+    x_train = []
+    y_train = []
+    s_train = []
+
+    x_val = []
+    y_val = []
+    s_val = []
+
+    x_test = []
+    y_test = []
+    s_test = []
+
+    for filename in ['training.mat', 'validation1.mat', 'validation2.mat']:
+        file_path = os.path.join(path, filename)
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"文件 {filename} 未找到, 请确保文件存在于 {path} 目录下")
+
+        EEG, labels = preprocess(file_path)
+
+        idxLeft = labels == 0
+        idxRight = labels == 1
+        EEGLeft = EEG[idxLeft, ...]
+        EEGRight = EEG[idxRight, ...]
+
+        trainNum = round(len(EEGLeft) * 0.8)
+        valNum = len(EEGLeft) - trainNum
+
+        if filename == "validation2.mat":
+            x_test.append(EEGLeft)
+            x_test.append(EEGRight)
+            y_test.append([0] * len(EEGLeft))
+            y_test.append([1] * len(EEGRight))
+            s_test.append([0] * (len(EEGLeft) + len(EEGRight)))
+            continue
+
+        if filename == "validation1.mat":
+            s_value = 0
+        elif filename == "training.mat":
+            s_value = 1
+        else:
+            continue
+
+        x_train.append(EEGLeft[:trainNum, ...])
+        x_train.append(EEGRight[:trainNum, ...])
+        y_train.append([0] * trainNum)
+        y_train.append([1] * trainNum)
+        s_train.append([s_value] * (trainNum * 2))  # 分配不同的 s 标签
+
+        x_val.append(EEGLeft[trainNum:, ...])
+        x_val.append(EEGRight[trainNum:, ...])
+        y_val.append([0] * valNum)
+        y_val.append([1] * valNum)
+        s_val.append([s_value] * (valNum * 2))
+
+    x_train = np.concatenate(x_train, axis=0).astype(np.float32)
+    y_train = np.concatenate(y_train, axis=0).astype(np.int32)
+    y_train = to_categorical(y_train)
+    s_train = np.concatenate(s_train, axis=0).astype(np.int32)
+    s_train = to_categorical(s_train, num_classes=2) 
+    x_val = np.concatenate(x_val, axis=0).astype(np.float32)
+    y_val = np.concatenate(y_val, axis=0).astype(np.int32)
+    y_val = to_categorical(y_val)
+    s_val = np.concatenate(s_val, axis=0).astype(np.int32)
+    s_val = to_categorical(s_val, num_classes=2)
+
+    x_test = np.concatenate(x_test, axis=0).astype(np.float32)
+    y_test = np.concatenate(y_test, axis=0).astype(np.int32)
+    y_test = to_categorical(y_test)
+    s_test = np.concatenate(s_test, axis=0).astype(np.int32)
+    s_test = to_categorical(s_test, num_classes=2)
+
+    train_set = [x_train, y_train, s_train]
+    val_set = [x_val, y_val, s_val]
+    test_set = [x_test, y_test, s_test]
+    return train_set, val_set, test_set
+
+
+def preprocess(data_file):
+    '''preprocess EEG data and labels of shape (N,C,T) and (N)'''
+    print(f'loading data from: {data_file}')
+    data = io.loadmat(data_file)
+
+    # label numbers must start at 0
+    EEG = data['EEG_data'].astype(np.float64)
+    EEG = EEG.transpose((2, 0, 1))
+    labels = data['labels'].reshape(-1).astype(np.int32)  # N
+    labels = labels - np.min(labels)
+
+    idx = labels == 2
+    labels[idx] -= 1
+
+    # EEG = signal.resample(EEG,128 * 4,axis=2)
+    FS = 128
+
+    # [0.5, 2.5]
+    timePoint = [0.5, 2.5]
+    EEG = EEG[:, :, int(timePoint[0] * FS):int(timePoint[1] * FS)]
+    # filter bank signal
+    EEG_bank = []
+    for bank in [(4, 40)]:
+        parameter = signal.butter(N=3, Wn=bank, btype='bandpass', fs=FS)
+        EEG_filtered = signal.lfilter(parameter[0], parameter[1], EEG)
+        # EEG_filtered = exponential_moving_standardize(EEG_filtered)
+        EEG_bank.append(EEG_filtered)
+    EEG = np.concatenate(EEG_bank, axis=1).astype(np.float32)  # N,F*C,T
+
+    EEG = EEG[:, :, :, None]
+
+    print(f'original data: {EEG.shape} {labels.shape}')
+    print(np.max(EEG))
+    return EEG, labels
+
+
+if __name__ == '__main__':
+    log = 'log'
+    path = r'../Data'
+    subList = os.listdir(path)
+    subList.sort(key=lambda x: int(re.search(r'\d+', x).group()))
+    subList.sort()
+
+    adv = True
+
+    total_loss = 0
+    total_acc = 0
+    total_cla_loss = 0
+    total_adv_loss = 0
+    total_adv_acc = 0
+
+    log_file = log + f'/test_{adv}.csv'
+
+    for i in range(len(subList)):
+        subject = subList[i]
+        print(f'------{subject}------')
+        train_set, validation_set, test_set = LoadDate(path=path, testsub=subject)
+        net = AdversarialCNN(chans=59, samples=2 * 128, n_output=2, n_nuisance=2, architecture='EEGNet',
+                             adversarial=adv,
+                             lam=0.5)
+        net.train(train_set, validation_set, log=log, epochs=200, batch_size=32)
+
+        x_test, y_test, s_test = test_set
+        y = [y_test, s_test]
+        val_log = net.acnn.test_on_batch(x_test, y)
+
+        print(f"{subject} Test - [Loss: %f] - [CLA loss: %f, acc: %.2f%%] - [ADV loss: %f, acc: %.2f%%]"
+              % (val_log[0], val_log[1], 100 * val_log[3], val_log[2], 100 * val_log[4]))
+
+        if i == 0 and os.path.exists(log_file):
+            os.remove(log_file) 
+            print(f"Deleted existing log file: {log_file}")
+
+        file_exists = os.path.exists(log_file)
+
+        # Open the file, if exists append, else create and write the header
+        with open(log_file, 'a' if file_exists else 'w') as f:
+            if not file_exists:
+                f.write('Subject, Loss, CLA Loss, CLA Accuracy, ADV Loss, ADV Accuracy\n')
+            f.write(f'{i},{val_log[0]},{val_log[1]},{100 * val_log[3]},{val_log[2]},{100 * val_log[4]}\n')
+
+        total_loss += val_log[0]
+        total_cla_loss += val_log[1]
+        total_acc += 100 * val_log[3]
+        total_adv_loss += val_log[2]
+        total_adv_acc += 100 * val_log[4]
+
+        tf.keras.backend.clear_session()
+        print(f"Memory cleared for subject {subject}")
+
+    avg_loss = total_loss / len(subList)
+    avg_cla_loss = total_cla_loss / len(subList)
+    avg_acc = total_acc / len(subList)
+    avg_adv_loss = total_adv_loss / len(subList)
+    avg_adv_acc = total_adv_acc / len(subList)
+
+    print(f"Average Loss: {avg_loss}")
+    print(f"Average CLA Loss: {avg_cla_loss}")
+    print(f"Average Accuracy: {avg_acc}%")
+    print(f"Average ADV Loss: {avg_adv_loss}")
+    print(f"Average ADV Acc: {avg_adv_acc}")
+
+    with open(log + f'/test_{adv}.csv', 'a') as f:
+        f.write(f'Average,{avg_loss},{avg_cla_loss},{avg_acc},{avg_adv_loss},{avg_adv_loss}\n')
